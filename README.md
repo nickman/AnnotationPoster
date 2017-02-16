@@ -6,6 +6,7 @@ An HttpRPC Plugin for OpenTSDB to post Annotations by metric name and tags.
 Add these to your opentsdb.conf:
 
 > tsd.http.rpc.plugins=net.opentsdb.tsd.AnnotationPoster
+
 > tsd.core.plugin_path=&lt;plugin path&gt;
 
 Copy the annotation poseter jar into &lt;plugin path&gt;.
