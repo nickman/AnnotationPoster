@@ -13,12 +13,3 @@ Start OpenTSDB.
 
 Post or put annotations to **http://&lt;host&gt;:&lt;port&gt;/plugin/postannotation**
 Body can be a single or array of JSON annotations.
-
-Postman Example:
-
-
-
-
-
-
-
