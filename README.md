@@ -9,7 +9,7 @@ Add these to your opentsdb.conf:
 
 > tsd.core.plugin_path=&lt;plugin path&gt;
 
-Copy the annotation poseter jar into &lt;plugin path&gt;.
+Copy the annotation poster jar into &lt;plugin path&gt;.
 Start OpenTSDB.
 
 Post or put annotations to **http://&lt;host&gt;:&lt;port&gt;/plugin/postannotation**
