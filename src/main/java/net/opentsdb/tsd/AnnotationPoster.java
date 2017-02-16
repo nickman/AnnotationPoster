@@ -297,6 +297,8 @@ public class AnnotationPoster extends HttpRpcPlugin {
 						completion.add(annotationDef);
 						((ObjectNode)node).put("tsuid", tsuid);
 						final Annotation annotation = annotationReader.readValue(node);
+						annotation.getCustom().put("-metric-", metric);
+						annotation.getCustom().put("-tags-", JSON.serializeToString(tags));
 						annotation.syncToStorage(tsdb, overwrite).addCallback(new Callback<Void, Boolean>() {
 							@Override
 							public Void call(final Boolean success) throws Exception {
