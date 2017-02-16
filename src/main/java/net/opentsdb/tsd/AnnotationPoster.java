@@ -19,7 +19,8 @@ import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.jboss.netty.buffer.ChannelBuffer;
 import org.jboss.netty.buffer.ChannelBufferFactory;
@@ -46,6 +47,7 @@ import net.opentsdb.core.TSDB;
 import net.opentsdb.core.Tags;
 import net.opentsdb.meta.Annotation;
 import net.opentsdb.meta.TSUIDQuery;
+import net.opentsdb.stats.Histogram;
 import net.opentsdb.stats.StatsCollector;
 import net.opentsdb.uid.UniqueId;
 import net.opentsdb.utils.Config;
@@ -74,7 +76,25 @@ public class AnnotationPoster extends HttpRpcPlugin {
 	protected UniqueId tag_names;
 	/** Unique IDs for the tag values. */
 	protected UniqueId tag_values;
-
+	/** Default typing object mapper */
+	protected final ObjectMapper dtMapper = new ObjectMapper().enableDefaultTyping(ObjectMapper.DefaultTyping.NON_FINAL);
+	/** Request monitoring */
+	protected final Histogram monitor = new Histogram(16000, (short) 2, 100);
+	/** Completed request counter */
+	protected final AtomicLong completeRequestCounter = new AtomicLong();
+	/** Incoming request counter */
+	protected final AtomicLong incomingRequestCounter = new AtomicLong();
+	/** Tag map type reference */
+	protected final TypeReference<Map<String, String>> MAP_TYPE_REF = new TypeReference<Map<String, String>>(){};
+	/** Outbound Tag map type reference */
+	protected final TypeReference<Map<String, Object>> MAP_TYPE_OBJ_REF = new TypeReference<Map<String, Object>>(){}; 
+	
+	/** Tag map object reader */
+	protected final  ObjectReader tagMapReader = JSON.getMapper().reader(MAP_TYPE_REF);
+	/** Annotation object reader */
+	protected final  ObjectReader annotationReader = JSON.getMapper().reader(Annotation.class);
+	
+	
 	
 	
 	/** The charset for JSON */
@@ -85,8 +105,19 @@ public class AnnotationPoster extends HttpRpcPlugin {
 	protected static final ChannelBuffer EMPTY_JSON_OBJ = new ReadOnlyChannelBuffer(ChannelBuffers.wrappedBuffer("{}".getBytes(UTF8)));
 	/** Charset used to convert Strings to byte arrays and back. */
 	protected static final Charset CHARSET = Charset.forName("ISO-8859-1");
+	/** The stats metric name prefix */
+	public static final String METRIC_NAME = "http.plugin.apost.";
 	
 	
+	
+	/**
+	 * We need the TSDB UniqueId instances to share cache, preload and configuration options.
+	 * For now, this is the only way to get this. Although it's reflection, we only do it once
+	 * at init time, so it's not a significant performamce hit.
+	 * @param tsdb The parent TSDB instance
+	 * @param fieldName The field name of the target UniqueId
+	 * @return The named UniqueId
+	 */
 	protected static UniqueId reflect(final TSDB tsdb, final String fieldName) {
 		try {
 			final Field f = TSDB.class.getDeclaredField(fieldName);
@@ -126,16 +157,18 @@ public class AnnotationPoster extends HttpRpcPlugin {
 	 */
 	@Override
 	public String version() {
-		return "2.3.0";
+		return "2.2.0.1";
 	}
-
+	
 	/**
 	 * {@inheritDoc}
 	 * @see net.opentsdb.tsd.HttpRpcPlugin#collectStats(net.opentsdb.stats.StatsCollector)
 	 */
 	@Override
 	public void collectStats(final StatsCollector collector) {
-		// TODO Auto-generated method stub
+		collector.record(METRIC_NAME + "elapsed", monitor, null);
+		collector.record(METRIC_NAME + "inrequests", incomingRequestCounter.get());
+		collector.record(METRIC_NAME + "complete", completeRequestCounter.get());
 	}
 
 	/**
@@ -163,86 +196,28 @@ public class AnnotationPoster extends HttpRpcPlugin {
 			try { is.close(); } catch (Exception x) {/* No Op */}
 		}
 	}
-	/** Tag map type reference */
-	protected final TypeReference<Map<String, String>> MAP_TYPE_REF = new TypeReference<Map<String, String>>(){}; 
-	/** Tag map object reader */
-	protected final  ObjectReader tagMapReader = JSON.getMapper().reader(MAP_TYPE_REF);
-	/** Annotation object reader */
-	protected final  ObjectReader annotationReader = JSON.getMapper().reader(Annotation.class);
 	
 	
-	protected Annotation fromNode(final JsonNode node) throws Exception  {
-		return annotationReader.readValue(node);
-	}
-	
-	protected class TSUIDLookupCB implements Callback<Deferred<Annotation>, byte[]> {
-		final JsonNode node;
-		final boolean overwrite;
-		public TSUIDLookupCB(final JsonNode node, final boolean overwrite) {
-			this.node = node;
-			this.overwrite = overwrite;
-		}
-		@Override
-		public Deferred<Annotation> call(final byte[] tsuid) throws Exception {
-			final Deferred<Annotation> def = new Deferred<Annotation>();
-			final String tsuidString = UniqueId.uidToString(tsuid);
-			((ObjectNode)node).put("tsuid", tsuidString);
-			final Annotation annotation = fromNode(node);
-			
-			try {
-				annotation.syncToStorage(tsdb, overwrite).addCallback(new Callback<Void, Boolean>() {
-					@Override
-					public Void call(final Boolean ok) throws Exception {
-						def.callback(ok ? annotation : null);
-						return null;
-					}
-				});				
-			} catch (IllegalStateException isx) {
-				def.callback(annotation);
-			} catch (Exception ex) {
-				def.callback(ex);
-			}			
-			return def;
-		}
-	}
-	
+	/**
+	 * Marshals the passed object to JSON and writes it out to the passed output stream
+	 * @param os The output stream to write to
+	 * @param obj The object to marshal and write
+	 * @return the number of bytes written
+	 * @throws Exception thrown on any JSON marshalling or IO error
+	 */
 	protected int writeToOutput(final ChannelBufferOutputStream os, final Object obj) throws Exception {
 		JSON.getMapper().writeValue(os, obj);
 		return os.writtenBytes();
 	}
 	
-//	  /**
-//	   * Returns a partially initialized row key for this metric and these tags. The
-//	   * only thing left to fill in is the base timestamp.
-//	   */
-//	  byte[] rowKeyTemplate(final TSDB tsdb, final String metric,
-//	      final Map<String, String> tags) {
-//	    final short metric_width = TSDB.metrics_width();
-//	    final short tag_name_width = TSDB.tagk_width();
-//	    final short tag_value_width = TSDB.tagv_width();
-//	    final short num_tags = (short) tags.size();
-//
-//	    int row_size = (Const.SALT_WIDTH() + metric_width + Const.TIMESTAMP_BYTES 
-//	        + tag_name_width * num_tags + tag_value_width * num_tags);
-//	    final byte[] row = new byte[row_size];
-//
-//	    short pos = (short) Const.SALT_WIDTH();
-//
-//	    copyInRowKey(row, pos,
-//	        (tsdb.getConfig().auto_metric() ? tsdb.metrics.getOrCreateId(metric)
-//	            : tsdb.metrics.getId(metric)));
-//	    pos += metric_width;
-//
-//	    pos += Const.TIMESTAMP_BYTES;
-//
-//	    for (final byte[] tag : Tags.resolveOrCreateAll(tsdb, tags)) {
-//	      copyInRowKey(row, pos, tag);
-//	      pos += tag.length;
-//	    }
-//	    return row;
-//	  }
-	
 
+	/**
+	 * Returns a deferred TSUID string for the passed metric name and tags,
+	 * creating the UIDs if any do not exist.
+	 * @param metric The metric name
+	 * @param tags The tags
+	 * @return a deferred TSUID string
+	 */
 	protected Deferred<String> getOrCreate(final String metric, final Map<String, String> tags) {
 		try {
 			Tags.validateString("metric", metric);
@@ -278,9 +253,66 @@ public class AnnotationPoster extends HttpRpcPlugin {
 		return def;
 	}
 	
-	protected void lookupTsuidsAndSave(final HttpRpcPluginQuery query, final boolean overwrite, final JsonNode...nodes) {
+	/**
+	 * <p>Title: MetricId</p>
+	 * <p>Description: A value reference class to index the metric name and tags</p> 
+	 * <p><code>net.opentsdb.tsd.AnnotationPoster.MetricId</code></p>
+	 */
+	static class MetricId {
+		final String metric;
+		final Map<String, String> tags;
+		public MetricId(String metric, Map<String, String> tags) {
+			super();
+			this.metric = metric;
+			this.tags = tags;
+		}
+		@Override
+		public int hashCode() {
+			final int prime = 31;
+			int result = 1;
+			result = prime * result + ((metric == null) ? 0 : metric.hashCode());
+			result = prime * result + ((tags == null) ? 0 : tags.hashCode());
+			return result;
+		}
+		@Override
+		public boolean equals(Object obj) {
+			if (this == obj)
+				return true;
+			if (obj == null)
+				return false;
+			if (getClass() != obj.getClass())
+				return false;
+			MetricId other = (MetricId) obj;
+			if (metric == null) {
+				if (other.metric != null)
+					return false;
+			} else if (!metric.equals(other.metric))
+				return false;
+			if (tags == null) {
+				if (other.tags != null)
+					return false;
+			} else if (!tags.equals(other.tags))
+				return false;
+			return true;
+		}
+		
+		
+	}
+	
+	/**
+	 * Validates that a tsuid and underlying UIDs exist for the passed annotation metric name and tags,
+	 * then creates the corresponding annotations and saves them to hbase.
+	 * @param startTime The start time of the http rpc call in ms.
+	 * @param query The http plugin rpc call
+	 * @param overwrite true if http request was a <b>PUT</b>, false if it was a <b>POST</b>
+	 * @param nodes The parsed JSON nodes representing the annotations to write
+	 */
+	protected void lookupTsuidsAndSave(final long startTime, final HttpRpcPluginQuery query, final boolean overwrite, final JsonNode...nodes) {
 		final boolean multi = nodes.length > 1;
-		final List<Annotation> annotations = new CopyOnWriteArrayList<Annotation>();
+		
+		final String im = query.getQueryStringParam("includemetric");
+		final boolean includeMetricTags = im!=null; 
+		final Map<MetricId, Annotation> annotations = new ConcurrentHashMap<MetricId, Annotation>();
 		final List<Deferred<Annotation>> completion = new ArrayList<Deferred<Annotation>>(nodes.length);
 		for(final JsonNode node: nodes) {
 			try {
@@ -288,7 +320,7 @@ public class AnnotationPoster extends HttpRpcPlugin {
 				if(!node.has("tags")) throw new RuntimeException("No tags in request");
 				final String metric = node.get("metric").textValue();
 				final Map<String, String> tags = tagMapReader.readValue(node.get("tags"));
-				
+				final MetricId metricId = new MetricId(metric, tags);
 				
 				getOrCreate(metric, tags).addCallback(new Callback<Deferred<Annotation>, String>() {
 					@Override
@@ -297,13 +329,11 @@ public class AnnotationPoster extends HttpRpcPlugin {
 						completion.add(annotationDef);
 						((ObjectNode)node).put("tsuid", tsuid);
 						final Annotation annotation = annotationReader.readValue(node);
-						annotation.getCustom().put("-metric-", metric);
-						annotation.getCustom().put("-tags-", JSON.serializeToString(tags));
 						annotation.syncToStorage(tsdb, overwrite).addCallback(new Callback<Void, Boolean>() {
 							@Override
 							public Void call(final Boolean success) throws Exception {
 								if(success) {
-									annotations.add(annotation);
+									annotations.put(metricId, annotation);
 								}
 								annotationDef.callback(annotation);
 								return null;
@@ -318,7 +348,7 @@ public class AnnotationPoster extends HttpRpcPlugin {
 		}
 		Deferred.group(completion).addCallback(new Callback<Void, ArrayList<Annotation>>() {
 			@Override
-			public Void call(final ArrayList<Annotation> annotations) throws Exception {
+			public Void call(final ArrayList<Annotation> complete) throws Exception {
 				if(annotations==null || annotations.isEmpty()) {							
 					query.sendBuffer(HttpResponseStatus.OK, multi ? EMPTY_JSON_ARR : EMPTY_JSON_OBJ, "application/json");
 					return null;
@@ -334,11 +364,40 @@ public class AnnotationPoster extends HttpRpcPlugin {
 				try {
 					os = new ChannelBufferOutputStream(cb);							
 					if(multi) {
-						writeToOutput(os, annotations);
+						if(includeMetricTags) {
+							List<JsonNode> onodes = new ArrayList<JsonNode>(annotations.size());
+							for(Map.Entry<MetricId, Annotation> entry : annotations.entrySet()) {
+								final MetricId mid = entry.getKey();
+								final ObjectNode on = JSON.getMapper().valueToTree(entry.getValue());
+								on.put("metric", mid.metric);
+								on.putPOJO("tags", mid.tags);
+								onodes.add(on);
+							}
+							writeToOutput(os, onodes);
+						} else {
+							writeToOutput(os, annotations.values());
+						}
+						
 					} else {
-						writeToOutput(os, annotations.get(0));
-					}
+						if(includeMetricTags) {
+							final Map.Entry<MetricId, Annotation> ann = annotations.entrySet().iterator().next();
+							final ObjectNode on = JSON.getMapper().valueToTree(ann.getValue());
+							final MetricId mid = ann.getKey();
+							on.put("metric", mid.metric);
+							on.putPOJO("tags", mid.tags);								
+							writeToOutput(os, on);
+						} else {
+							writeToOutput(os, annotations.values().iterator().next());
+						}
+					
+					}					
 					query.sendBuffer(HttpResponseStatus.OK, cb, "application/json");
+					final long elapsed = System.currentTimeMillis() - startTime;
+					if(elapsed < Integer.MAX_VALUE) {
+						final int elapsedInt = (int)elapsed;
+						monitor.add(elapsedInt);
+					}
+					completeRequestCounter.incrementAndGet();
 				} catch (Exception ex) {
 					LOG.error("Failed to send response", ex);
 					try { query.internalError(ex); } catch (Exception x) {/* No Op */}
@@ -351,6 +410,11 @@ public class AnnotationPoster extends HttpRpcPlugin {
 		});
 	}
 	
+	/**
+	 * Conerts the passed jackson array node to an array of the underlying json nodes
+	 * @param arrayNode The array node to convert
+	 * @return an array of json nodes
+	 */
 	protected JsonNode[] toArray(final ArrayNode arrayNode) {
 		final int size = arrayNode.size();
 		final JsonNode[] nodes = new JsonNode[size];
@@ -366,6 +430,8 @@ public class AnnotationPoster extends HttpRpcPlugin {
 	 */
 	@Override
 	public void execute(final TSDB tsdb, final HttpRpcPluginQuery query) throws IOException {
+		final long startTime = System.currentTimeMillis();
+		incomingRequestCounter.incrementAndGet();
 	    final HttpMethod method = query.method();		    
 	    if(!method.equals(HttpMethod.POST) && !method.equals(HttpMethod.PUT)) {
 	    	final String errMsg = "AnnotationPoster does not support Http Method [" + method.getName() + "]";
@@ -391,7 +457,7 @@ public class AnnotationPoster extends HttpRpcPlugin {
 	    	return;	    		    	
 	    }
 	    final JsonNode[] allNodes = node.isArray() ? toArray((ArrayNode)node) : new JsonNode[]{node};
-	    lookupTsuidsAndSave(query, overwrite, allNodes);
+	    lookupTsuidsAndSave(startTime, query, overwrite, allNodes);
 
 
 	}
